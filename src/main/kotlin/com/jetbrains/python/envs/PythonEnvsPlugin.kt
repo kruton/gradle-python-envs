@@ -2,23 +2,29 @@ package com.jetbrains.python.envs
 
 import org.apache.tools.ant.taskdefs.condition.Os
 import org.gradle.api.GradleException
+import org.gradle.api.InvalidUserDataException
 import org.gradle.api.Plugin
 import org.gradle.api.Project
 import org.gradle.api.Task
-import org.gradle.api.file.FileCopyDetails
-import org.gradle.kotlin.dsl.* // Import Kotlin DSL extensions
-import org.gradle.util.GradleVersion
+import org.gradle.api.file.Directory
+import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.provider.Property
+import org.gradle.api.provider.Provider
+import org.gradle.api.tasks.TaskProvider
+import org.gradle.kotlin.dsl.assign
+import org.gradle.kotlin.dsl.dependencies
+import org.gradle.kotlin.dsl.named
+import org.gradle.kotlin.dsl.register
+import org.gradle.kotlin.dsl.repositories
+import org.gradle.process.ExecOperations
 import java.io.File
 import java.net.URI
 import java.net.URL
-import java.nio.file.Files
-import java.nio.file.InvalidPathException
-import java.nio.file.Paths
-import org.gradle.api.Action
+
 
 class PythonEnvsPlugin : Plugin<Project> {
 
-    // Companion object for static-like members
     companion object {
         private val osName: String = System.getProperty("os.name").replace(" ", "").let {
             if (it.contains("Windows", ignoreCase = true)) "Windows" else it
@@ -28,12 +34,13 @@ class PythonEnvsPlugin : Plugin<Project> {
         private val isUnix: Boolean = Os.isFamily(Os.FAMILY_UNIX)
         private val isMacOsX: Boolean = Os.isFamily(Os.FAMILY_MAC)
 
-        private fun getUrlToDownloadConda(conda: Conda): URL {
-            val repository = if (conda.version?.contains("miniconda", ignoreCase = true) == true) "miniconda" else "archive"
-            val arch = getArch()
-            val ext = if (isWindows) "exe" else "sh"
-
-            return URI("https://repo.continuum.io/$repository/${conda.version}-$osName-$arch.$ext").toURL()
+        fun getUrlToDownloadConda(condaVersionProvider: Provider<String>): Provider<URL> {
+            return condaVersionProvider.map { condaVersion ->
+                val repository = if (condaVersion.contains("miniconda", ignoreCase = true)) "miniconda" else "archive"
+                val arch = getArch()
+                val ext = if (isWindows) "exe" else "sh"
+                URI("https://repo.continuum.io/$repository/${condaVersion}-$osName-$arch.$ext").toURL()
+            }
         }
 
         private fun getArch(): String {
@@ -48,673 +55,524 @@ class PythonEnvsPlugin : Plugin<Project> {
             return arch
         }
 
-        private fun getExecutable(executable: String, env: Python? = null, dir: File? = null, type: EnvType? = null): File {
-            val actualEnv = env ?: throw IllegalArgumentException("Environment must be provided if dir and type are not")
-            val actualDir = dir ?: actualEnv.envDir
-            val actualType = type ?: actualEnv.type
+        internal fun getExecutableProvider(
+            project: Project,
+            executable: String,
+            envTypeProvider: Provider<EnvType>,
+            envDirProvider: Provider<out Directory>,
+            use64BitProvider: Provider<Boolean>? = null
+        ): Provider<RegularFileProperty> {
+            return project.provider {
+                val envType = envTypeProvider.get()
+                val envDir = envDirProvider.get().asFile
+                val use64Bit = use64BitProvider?.orNull
 
-            val pathString = when (actualType) {
-                EnvType.PYTHON, EnvType.CONDA -> when (executable) {
-                    "pip", "virtualenv", "conda" -> if (isWindows) "Scripts/${executable}.exe" else "bin/${executable}"
-                    else -> if (executable.startsWith("python")) {
-                        if (isWindows) "${executable}.exe" else "bin/${executable}"
-                    } else {
-                        throw RuntimeException("$executable is not supported for $actualType yet")
+                val pathString = when (envType) {
+                    EnvType.PYTHON, EnvType.CONDA -> when (executable) {
+                        "pip", "virtualenv", "conda" -> if (isWindows) "Scripts/${executable}.exe" else "bin/${executable}"
+                        else -> if (executable.startsWith("python")) {
+                            if (isWindows) "${executable}.exe" else "bin/${executable}"
+                        } else {
+                            // Consider returning null or failing later if not found
+                            throw RuntimeException("$executable is not supported for $envType yet")
+                        }
                     }
+
+                    EnvType.JYTHON, EnvType.PYPY -> {
+                        val execName = if (envType == EnvType.JYTHON && executable == "python") "jython" else executable
+                        "bin/$execName${if (isWindows) ".bat" else ""}"
+                    }
+
+                    EnvType.IRONPYTHON -> when (executable) {
+                        "ipy", "python" -> "net45/${if (use64Bit == true) "ipy.exe" else "ipy32.exe"}"
+                        else -> "Scripts/${executable}.exe"
+                    }
+
+                    EnvType.VIRTUALENV -> if (isWindows) "Scripts/${executable}.exe" else "bin/${executable}"
                 }
-                EnvType.JYTHON, EnvType.PYPY -> {
-                    val execName = if (actualType == EnvType.JYTHON && executable == "python") "jython" else executable
-                    "bin/$execName${if (isWindows) ".exe" else ""}"
-                }
-                EnvType.IRONPYTHON -> when (executable) {
-                    "ipy", "python" -> "net45/${if (actualEnv.is64 == true) "ipy.exe" else "ipy32.exe"}" // Assuming is64 defaults or is set
-                    else -> "Scripts/${executable}.exe"
-                }
-                EnvType.VIRTUALENV -> if (isWindows) "Scripts/${executable}.exe" else "bin/${executable}"
-                null -> throw RuntimeException("Environment type is null, cannot determine executable path")
+                project.objects.fileProperty().fileValue(File(envDir, pathString))
             }
-
-            return File(actualDir, pathString)
         }
 
-        private fun getPipFile(project: Project): File {
-            val file = project.layout.buildDirectory.get().asFile.resolve("get-pip.py")
-            if (!file.exists()) {
-                project.ant.invokeMethod("get", mapOf(
-                    "dest" to file,
-                    "src" to URI("https://bootstrap.pypa.io/get-pip.py").toURL()
-                ))
+
+        // Replace old getPipFile with registration using DownloadTask
+        private fun registerGetPipTask(project: Project, bootstrapDir: DirectoryProperty): TaskProvider<DownloadTask> {
+            return project.tasks.register<DownloadTask>("prepareGetPipScript") {
+                description = "Downloads the get-pip.py bootstrap script."
+                group = "Build Environment Setup"
+                url.set("https://bootstrap.pypa.io/get-pip.py")
+                destination.set(bootstrapDir.file("get-pip.py"))
             }
-            return file
         }
 
-        // Helper to check if python executable exists and runs
-        private fun isPythonValid(project: Project, env: Python): Boolean {
-            val exec = try {
-                getExecutable("python", env)
-            } catch (e: Exception) {
-                return false // Cannot determine executable
+        internal fun runPipUpgrade(
+            project: Project, execOps: ExecOperations, pythonExecutable: File, pipOptions: String?
+        ) {
+            if (!pythonExecutable.exists()) {
+                project.logger.warn("Cannot upgrade pip/setuptools: Python executable not found at ${pythonExecutable.path}")
+                return
             }
+            project.logger.quiet("Force upgrading pip and setuptools using ${pythonExecutable.path}")
+            val command = mutableListOf(
+                pythonExecutable.absolutePath, "-m", "pip", "install", "--upgrade", "--force-reinstall"
+            )
+            pipOptions?.split(" ")?.filter { it.isNotBlank() }?.let { command.addAll(it) }
+            command.addAll(listOf("pip", "setuptools"))
 
-            if (!exec.exists()) return false
-
-            val result = project.exec {
-                commandLine(exec.absolutePath, "-c", "print(1)")
-                isIgnoreExitValue = true // Don't throw exception on non-zero exit
+            project.logger.debug("Executing pip upgrade: ${command.joinToString(" ")}")
+            val result = execOps.exec {
+                commandLine = command
+                isIgnoreExitValue = true
             }
-
-            return result.exitValue == 0
+            if (result.exitValue != 0) {
+                project.logger.warn("Pip/setuptools upgrade command exited with code ${result.exitValue}. Check logs.")
+            }
         }
 
-        // Renamed for clarity in Kotlin
-        private fun isPythonInvalid(project: Project, env: Python): Boolean {
-            return !isPythonValid(project, env)
+        internal fun runPipInstall(
+            project: Project, execOps: ExecOperations, pipExecutable: File, pipOptions: String?, packages: List<String>?
+        ) {
+            if (packages.isNullOrEmpty()) return
+            if (!pipExecutable.exists()) {
+                throw GradleException("Cannot install packages: pip executable not found at ${pipExecutable.path}")
+            }
+
+            project.logger.quiet("Installing packages via pip using ${pipExecutable.path}: $packages")
+            val command = mutableListOf(pipExecutable.absolutePath, "install")
+            pipOptions?.split(" ")?.filter { it.isNotBlank() }?.let { command.addAll(it) }
+            command.addAll(packages)
+
+            project.logger.debug("Executing pip install: ${command.joinToString(" ")}")
+            val result = execOps.exec {
+                commandLine = command
+            }
+            if (result.exitValue != 0) {
+                throw GradleException("pip install failed with packages $packages. Exit code: ${result.exitValue}")
+            }
         }
+
+        internal fun runCondaInstall(
+            project: Project,
+            execOps: ExecOperations,
+            condaExecutable: File,
+            targetEnvDir: File,
+            packages: List<String>?
+        ) {
+            if (packages.isNullOrEmpty()) return
+            if (!condaExecutable.exists()) {
+                throw GradleException("Cannot install conda packages: conda executable not found at ${condaExecutable.path}")
+            }
+
+            project.logger.quiet("Installing packages via conda using ${condaExecutable.path} into ${targetEnvDir.path}: $packages")
+            val command = mutableListOf(
+                condaExecutable.absolutePath, "install", "-y", "-p", targetEnvDir.absolutePath
+            )
+            command.addAll(packages)
+
+            project.logger.debug("Executing conda install: ${command.joinToString(" ")}")
+            val result = execOps.exec {
+                commandLine = command
+            }
+            if (result.exitValue != 0) {
+                throw GradleException("conda install failed with packages $packages. Exit code: ${result.exitValue}")
+            }
+        }
+
     }
 
     override fun apply(project: Project) {
-        val envs = project.extensions.create<PythonEnvsExtension>("envs")
-
-        // Configure default directories relative to the project
-        envs.bootstrapDirectory = envs.bootstrapDirectory ?: project.layout.buildDirectory.dir("python-envs/bootstrap").get().asFile
-        envs.envsDirectory = envs.envsDirectory ?: project.layout.projectDirectory.dir("python-envs/envs").asFile
-
+        val envs = project.extensions.create(
+            "envs", PythonEnvsExtension::class.java, project.objects, project.layout
+        )
 
         project.repositories {
             mavenCentral()
         }
 
-        project.configurations.create("jython")
+        // Master tasks for aggregation
+        val buildPythons = project.tasks.register("build_pythons") {
+            group = "Build Environment"
+            description = "Builds configured Python/Jython/PyPy environments."
+        }
+        val buildPythonsFromZip = project.tasks.register("build_pythons_from_zip") {
+            group = "Build Environment"
+            description = "Builds Python/IronPython environments from pre-built zip archives."
+        }
+        val buildVirtualenvs = project.tasks.register("build_virtual_envs") {
+            group = "Build Environment"
+            description = "Creates virtual environments based on existing Python environments."
+        }
+        val buildCondas = project.tasks.register("build_condas") {
+            group = "Build Environment"
+            description = "Bootstraps base Conda (Miniconda/Anaconda) environments."
+        }
+        val buildCondaEnvs = project.tasks.register("build_conda_envs") {
+            group = "Build Environment"
+            description = "Creates Conda environments based on existing Conda installations."
+        }
+
+        // --- Initial Configuration Phase ---
+        // Register tasks that don't depend on potentially implicit configurations
+
+        val getPipTask = registerGetPipTask(project, envs.bootstrapDirectory)
+        val installPythonBuildTaskProvider =
+            if (isUnix) registerInstallPythonBuildTask(project, envs.bootstrapDirectory.dir("python-build")) else null
+        val jythonConfiguration = project.configurations.create("jython")
+
+        envs.pythonsFromZip.all {
+            configurePythonFromZipTask(project, this, envs, getPipTask, buildPythonsFromZip)
+        }
 
         project.afterEvaluate {
-            // Configure Jython dependency only if needed
-            if (envs.pythons.any { it.type == EnvType.JYTHON }) {
-                project.dependencies {
-                    add("jython", "org.python:jython-installer:2.7.1")
-                }
-            }
-
-            val pythonBuildDir = project.layout.buildDirectory.dir("python-build").get().asFile
-            val installPythonBuildTask = createInstallPythonBuildTask(project, pythonBuildDir)
-
-            val pythonTask = tasks.register("build_pythons") {
-                group = "Build Environment"
-                description = "Builds configured Python/Jython/PyPy environments from source or distributions."
-                onlyIf { envs.pythons.isNotEmpty() }
-
-                envs.pythons.forEach { env ->
-                    when (env.type) {
-                        EnvType.PYTHON -> {
-                            if (isUnix) {
-                                dependsOn(createPythonUnixTask(project, env, installPythonBuildTask))
-                            } else if (isWindows) {
-                                dependsOn(createPythonWindowsTask(project, env))
-                            } else {
-                                logger.error("Unsupported OS for Python build: $osName")
-                            }
-                        }
-                        EnvType.JYTHON -> dependsOn(createJythonTask(project, env))
-                        EnvType.PYPY -> {
-                            if (isUnix) {
-                                dependsOn(createPythonUnixTask(project, env, installPythonBuildTask)) // Assuming PyPy uses python-build
-                            } else {
-                                logger.warn("PyPy installation via build isn't supported on $osName, consider using pythonFromZip.")
-                            }
-                        }
-                        else -> logger.error("${env.type} is not supported in the 'python' block.") // Should not happen based on extension
+            // Step 1: Validate configurations
+            if (envs.zipRepository.isPresent && envs.shouldUseZipsFromRepository.getOrElse(false)) {
+                envs.pythons.forEach { pythonEnv ->
+                    if (pythonEnv.patchFileUri.isPresent) {
+                        throw InvalidUserDataException("A patch is defined for a pre-built Python")
                     }
-                }
-            }
-
-            val pythonFromZipTask = tasks.register("build_pythons_from_zip") {
-                group = "Build Environment"
-                description = "Builds Python/IronPython environments from pre-built zip archives."
-                onlyIf { envs.pythonsFromZip.isNotEmpty() }
-
-                envs.pythonsFromZip.forEach { env ->
-                    dependsOn(tasks.register("Bootstrap_${env.type ?: "Unknown"}_${env.name}_from_archive") {
-                        onlyIf { env.url != null && (!env.envDir.exists() || isPythonInvalid(project, env)) }
-
-                        doFirst {
-                            project.layout.buildDirectory.get().asFile.mkdirs()
-                            if (env.envDir.exists()) env.envDir.deleteRecursively()
-                            env.envDir.mkdirs()
-                        }
-
-                        doLast {
-                            val url = env.url ?: return@doLast // Should be caught by onlyIf
-                            try {
-                                val archiveName = url.path.substring(url.path.lastIndexOf('/') + 1)
-                                if (!archiveName.endsWith(".zip", ignoreCase = true)) {
-                                    throw GradleException("Wrong archive extension, only zip is supported (URL: $url)")
-                                }
-
-                                val zipArchive = project.layout.buildDirectory.get().asFile.resolve(archiveName)
-                                logger.quiet("Downloading $archiveName archive from $url")
-                                project.ant.invokeMethod("get", mapOf("dest" to zipArchive, "src" to url, "verbose" to true))
-
-                                logger.quiet("Unzipping downloaded $archiveName archive to ${env.envDir}")
-                                // Ensure target exists and is a directory
-                                if (!env.envDir.exists()) env.envDir.mkdirs()
-                                else if (!env.envDir.isDirectory) throw GradleException("Target unzip path is not a directory: ${env.envDir}")
-
-                                project.copy {
-                                    from(zipTree(zipArchive))
-                                    into(env.envDir)
-                                }
-
-                                // Handle archives containing a single top-level directory
-                                env.envDir.listFiles()?.let { files ->
-                                    if (files.size == 1 && files[0].isDirectory) {
-                                        val intermediateDir = files[0]
-                                        logger.quiet("Moving contents from intermediate directory ${intermediateDir.name}")
-                                        // Move contents, then delete the now-empty intermediate directory
-                                        intermediateDir.listFiles()?.forEach { fileToMove ->
-                                            val target = File(env.envDir, fileToMove.name)
-                                            if (!fileToMove.renameTo(target)) {
-                                                logger.warn("Could not move ${fileToMove.path} to ${target.path}")
-                                                // Consider adding copy/delete fallback if rename fails
-                                            }
-                                        }
-                                        intermediateDir.delete()
-                                    }
-                                }
-
-                                if (env.type != null) {
-                                     // Install pip if necessary (e.g., for IronPython or minimal zips)
-                                    if (!getExecutable("pip", env).exists()) {
-                                        logger.quiet("Attempting to install pip and setuptools")
-                                        val pythonExec = getExecutable(if(env.type == EnvType.IRONPYTHON) "ipy" else "python", env)
-                                        if (pythonExec.exists()) {
-                                             if (env.type == EnvType.IRONPYTHON) {
-                                                 project.exec {
-                                                     executable(pythonExec.absolutePath)
-                                                     args("-m", "ensurepip")
-                                                     isIgnoreExitValue = true // ensurepip might fail if already present
-                                                 }
-                                            } else {
-                                                project.exec {
-                                                    executable(pythonExec.absolutePath)
-                                                    args(getPipFile(project).absolutePath)
-                                                    isIgnoreExitValue = true
-                                                }
-                                            }
-                                        } else {
-                                            logger.warn("Could not find python executable at ${pythonExec.path} to install pip.")
-                                        }
-                                    }
-                                    // Upgrade pip even if it exists, as it might be outdated
-                                    if (getExecutable("pip", env).exists()) {
-                                        upgradePipAndSetuptools(project, envs, env)
-                                    }
-                                }
-
-                                logger.quiet("Deleting $archiveName archive")
-                                zipArchive.delete()
-
-                                // Install packages specified for this env
-                                pipInstall(project, envs, env, env.packages)
-
-                            } catch (e: Exception) {
-                                logger.error("Error bootstrapping ${env.name} from zip: ${e.message}", e)
-                                throw GradleException("Failed to bootstrap ${env.name} from zip: ${e.message}", e)
-                            }
-                        }
-                    })
-                }
-            }
-
-            val virtualenvsTask = tasks.register("build_virtual_envs") {
-                group = "Build Environment"
-                description = "Creates virtual environments based on existing Python environments."
-                mustRunAfter(pythonTask, pythonFromZipTask)
-                onlyIf { envs.virtualEnvs.isNotEmpty() }
-
-                envs.virtualEnvs.forEach { env ->
-                    if (env.sourceEnv.type == EnvType.IRONPYTHON) {
-                        logger.warn("IronPython does not support standard virtualenvs. Skipping ${env.name}.")
-                        return@forEach // Continue to next env
+                    val newEnv = objects.newInstance(Python::class.java, name).apply {
+                        this.version.set(pythonEnv.version)
+                        this.url.set(
+                            getUrlFromRepository(
+                                envs.zipRepository.get(), "python", pythonEnv.version.get(), pythonEnv.use64Bit.get()
+                            )
+                        )
+                        this.packages.set(pythonEnv.packages)
                     }
-                    if (env.sourceEnv.type == null) {
-                         logger.warn("Source environment ${env.sourceEnv.name} for virtualenv ${env.name} has an unknown type. Skipping.")
-                         return@forEach
-                    }
-
-                    dependsOn(tasks.register("Create_virtualenv_${env.name}") {
-                        // Depend on the task that creates the source environment
-                        val sourceTaskName = "Bootstrap_${env.sourceEnv.type}_${env.sourceEnv.name}" + if(envs.pythonsFromZip.contains(env.sourceEnv)) "_from_archive" else ""
-                        val sourceTask = tasks.findByName(sourceTaskName)
-                        if(sourceTask != null) {
-                           dependsOn(sourceTask)
-                        } else {
-                            logger.warn("Could not find source task '$sourceTaskName' for virtualenv '${env.name}' dependency.")
-                        }
-
-                        onlyIf { !env.envDir.exists() || isPythonInvalid(project, env) }
-
-                        doFirst {
-                             if (env.envDir.exists()) env.envDir.deleteRecursively()
-                             env.envDir.mkdirs()
-                        }
-
-                        doLast {
-                            logger.quiet("Installing 'virtualenv' package into source environment ${env.sourceEnv.name}")
-                            pipInstall(project, envs, env.sourceEnv, listOf("virtualenv"))
-
-                            logger.quiet("Creating virtualenv ${env.name} from ${env.sourceEnv.name} at ${env.envDir}")
-                            project.exec {
-                                workingDir = env.sourceEnv.envDir
-                                executable = getExecutable("virtualenv", env.sourceEnv).absolutePath
-                                // Use --python for clarity if possible, or rely on executable path
-                                args = listOf(env.envDir.absolutePath, "--always-copy")
-                            }
-
-                            pipInstall(project, envs, env, env.packages)
-                        }
-                    })
+                    configurePythonFromZipTask(project, newEnv, envs, getPipTask, buildPythonsFromZip)
+                }
+            } else {
+                envs.pythons.all {
+                    configurePythonTask(
+                        project,
+                        this,
+                        envs,
+                        installPythonBuildTaskProvider,
+                        jythonConfiguration,
+                        getPipTask,
+                        buildPythons
+                    )
                 }
             }
 
-            val condaTask = tasks.register("build_condas") {
-                group = "Build Environment"
-                description = "Bootstraps base Conda (Miniconda/Anaconda) environments."
-                onlyIf { envs.condas.isNotEmpty() }
+            // Step 2: Ensure Jython dependency is added if needed (needs to be in afterEvaluate)
+            if (envs.pythons.any { it.type.getOrElse(EnvType.PYTHON) == EnvType.JYTHON }) {
+                project.dependencies { add("jython", "org.python:jython-installer:2.7.1") }
+            }
 
-                envs.condas.forEach { env ->
-                    dependsOn(tasks.register("Bootstrap_${env.type}_${env.name}") {
-                        onlyIf { !env.envDir.exists() || isPythonInvalid(project, env) } // Check python inside conda
-
-                        doFirst {
-                            project.layout.buildDirectory.get().asFile.mkdirs()
-                             if (env.envDir.exists()) env.envDir.deleteRecursively()
-                             env.envDir.mkdirs()
-                        }
-
-                        doLast {
-                            val urlToConda = getUrlToDownloadConda(env)
-                            val installerName = urlToConda.path.substring(urlToConda.path.lastIndexOf('/') + 1)
-                            val installer = project.layout.buildDirectory.get().asFile.resolve(installerName)
-
-                            if (!installer.exists()) {
-                                logger.quiet("Downloading $installerName")
-                                project.ant.invokeMethod("get", mapOf("dest" to installer, "src" to urlToConda))
-                            }
-
-                            logger.quiet("Bootstrapping Conda to ${env.envDir}")
-                            project.exec {
-                                if (isWindows) {
-                                    commandLine(installer.absolutePath, "/InstallationType=JustMe", "/AddToPath=0", "/RegisterPython=0", "/S", "/D=${env.envDir.absolutePath}")
-                                } else {
-                                    commandLine("bash", installer.absolutePath, "-b", "-p", env.envDir.absolutePath)
-                                }
-                            }
-                            // Make installer executable on Unix if needed (though bash execution might not require it)
-                            if(isUnix) installer.setExecutable(true)
-
-                            // Need to install Python explicitly potentially?
-                            // Conda might come with a base python, check version?
-
-                            pipInstall(project, envs, env, env.packages) // Install pip packages
-                            condaInstall(project, env, env.condaPackages) // Install conda packages
-                        }
-                    })
+            // Step 3: Ensure all required Conda configurations exist
+            val requiredSourceCondaNames = envs.condaEnvs.map { it.sourceEnvName.get() }.toSet()
+            val missingSourceCondaNames = requiredSourceCondaNames.filter { sourceName ->
+                envs.condas.findByName(sourceName) == null
+            }
+            missingSourceCondaNames.forEach { sourceName ->
+                project.logger.info("Defining implicit source conda environment '$sourceName' with version '\${PythonEnvsExtension.CONDA_DEFAULT_VERSION}'.")
+                envs.condas.maybeCreate(sourceName).apply {
+                    this.version.set(PythonEnvsExtension.CONDA_DEFAULT_VERSION)
                 }
             }
 
-            val condaEnvsTask = tasks.register("build_conda_envs") {
-                group = "Build Environment"
-                description = "Creates Conda environments based on existing Conda installations."
-                mustRunAfter(condaTask)
-                onlyIf { envs.condaEnvs.isNotEmpty() }
-
-                envs.condaEnvs.forEach { env ->
-                    dependsOn(tasks.register("Create_conda_env_${env.name}") {
-                         // Depend on the task that creates the source Conda environment
-                        val sourceTaskName = "Bootstrap_${env.sourceEnv.type}_${env.sourceEnv.name}"
-                        val sourceTask = tasks.findByName(sourceTaskName)
-                         if(sourceTask != null) {
-                           dependsOn(sourceTask)
-                        } else {
-                            logger.warn("Could not find source task '$sourceTaskName' for condaenv '${env.name}' dependency.")
-                        }
-
-                        onlyIf { !env.envDir.exists() || isPythonInvalid(project, env) }
-
-                        doFirst {
-                            if (env.envDir.exists()) env.envDir.deleteRecursively()
-                            env.envDir.mkdirs()
-                        }
-
-                        doLast {
-                            logger.quiet("Creating conda env '${env.name}' with Python ${env.version} at ${env.envDir}")
-                            project.exec {
-                                executable = getExecutable("conda", env.sourceEnv).absolutePath
-                                // Base conda packages + python version + specified conda packages
-                                args = listOf(
-                                    "create", "-p", env.envDir.absolutePath, "-y", "python=${env.version}"
-                                ) + (env.condaPackages ?: emptyList())
-                            }
-
-                            // Install pip packages into the created conda env
-                            pipInstall(project, envs, env, env.packages)
-                        }
-                    })
+            // Step 4: Register tasks for ALL Conda configurations (explicit and implicit)
+            envs.condas.forEach { condaConfig ->
+                val taskName = "Bootstrap_${condaConfig.name}"
+                if (project.tasks.findByName(taskName) == null) {
+                    project.logger.debug("Registering task '$taskName' for conda config '${condaConfig.name}'")
+                    val provider = registerCondaTask(project, condaConfig, envs)
+                    buildCondas.configure { dependsOn(provider) }
+                } else {
+                    project.logger.debug("Task '$taskName' already registered for conda config '${condaConfig.name}'")
                 }
             }
 
-            tasks.register("build_envs") {
-                group = "Build Environment"
-                description = "Builds all configured Python environments (Python, Conda, Virtualenv, etc.)."
-                dependsOn(pythonTask, pythonFromZipTask, virtualenvsTask, condaTask, condaEnvsTask)
+            // Step 5: Configure dependent tasks (Virtualenv)
+            envs.virtualEnvs.forEach { virtualEnvConfig ->
+                configureVirtualenvTask(project, virtualEnvConfig, envs, buildVirtualenvs)
             }
+
+            // Step 6: Configure dependent tasks (CondaEnv)
+            envs.condaEnvs.forEach { condaEnvConfig ->
+                configureCondaEnvTask(project, condaEnvConfig, envs, buildCondaEnvs)
+            }
+        }
+
+        // Configure master build task dependencies
+        project.tasks.register("build_envs") {
+            group = "Build Environment"
+            description = "Builds all configured Python environments (Python, Conda, Virtualenv, etc.)."
+            dependsOn(buildPythons, buildPythonsFromZip, buildVirtualenvs, buildCondas, buildCondaEnvs)
         }
     }
 
-    private fun createInstallPythonBuildTask(project: Project, installDir: File): Task {
-        return project.tasks.register("install_python_build") {
-            group = "Build Environment Setup"
+    // --- Helper methods to encapsulate configuration logic ---
+
+    private fun getUrlFromRepository(zipRepository: URL, type: String, version: String, use64Bit: Boolean = true) =
+        zipRepository.toURI().resolve("$type-$version-${if (use64Bit) "64" else "32"}.zip")
+
+    private fun configurePythonTask(
+        project: Project,
+        env: Python,
+        envs: PythonEnvsExtension,
+        installPythonBuildTaskProvider: TaskProvider<InstallPythonBuildTask>?,
+        jythonConfiguration: org.gradle.api.artifacts.Configuration,
+        getPipTask: TaskProvider<DownloadTask>,
+        buildPythons: TaskProvider<Task>
+    ) {
+        val bootstrapTask = when (val resolvedType = env.type.getOrElse(EnvType.PYTHON)) {
+            EnvType.PYTHON, EnvType.PYPY -> {
+                if (isUnix) {
+                    if (installPythonBuildTaskProvider == null) {
+                        project.logger.warn("Unix environment requested but installPythonBuildTask is not available. Skipping ${env.name}")
+                        null
+                    } else {
+                        registerPythonUnixTask(project, env, installPythonBuildTaskProvider, envs.pipInstallOptions)
+                    }
+                } else if (isWindows) {
+                    registerPythonWindowsTask(project, env, getPipTask, envs.pipInstallOptions)
+                } else {
+                    project.logger.warn("Unsupported OS for Python/PyPy build via source/installer: $osName for env ${env.name}")
+                    null
+                }
+            }
+
+            EnvType.JYTHON -> registerJythonTask(project, env, jythonConfiguration, envs.pipInstallOptions)
+            else -> {
+                project.logger.error("$resolvedType is not supported in the 'pythons' block for env ${env.name}.")
+                null
+            }
+        }
+        bootstrapTask?.let { buildPythons.configure { dependsOn(it) } }
+    }
+
+    private fun configurePythonFromZipTask(
+        project: Project,
+        env: Python,
+        envs: PythonEnvsExtension,
+        getPipTask: TaskProvider<DownloadTask>,
+        buildPythonsFromZip: TaskProvider<Task>
+    ) {
+        val bootstrapTask = registerPythonFromZipTask(project, env, getPipTask, envs)
+        buildPythonsFromZip.configure { dependsOn(bootstrapTask) }
+    }
+
+    private fun configureVirtualenvTask(
+        project: Project, env: VirtualEnv, envs: PythonEnvsExtension, buildVirtualenvs: TaskProvider<Task>
+    ) {
+        val sourceTaskProvider: Provider<TaskProvider<out Task>> = project.provider {
+            val sourceName = env.sourceEnvName.get()
+            val sourcePython = envs.pythons.findByName(sourceName)
+            val sourcePythonZip = envs.pythonsFromZip.findByName(sourceName)
+
+            if (sourcePython != null) {
+                if (sourcePython.type.getOrElse(EnvType.PYTHON) == EnvType.IRONPYTHON) {
+                    throw GradleException("Cannot create virtualenv '${env.name}' from IronPython source '$sourceName'")
+                }
+                project.tasks.named("Bootstrap_${sourceName}")
+            } else if (sourcePythonZip != null) {
+                if (sourcePythonZip.type.getOrElse(EnvType.PYTHON) == EnvType.IRONPYTHON) {
+                    throw GradleException("Cannot create virtualenv '${env.name}' from IronPython source '$sourceName'")
+                }
+                project.tasks.named("Bootstrap_${sourceName}_from_archive")
+            } else {
+                // This should ideally not happen if source validation is done earlier, but keep as fallback
+                throw GradleException("Cannot find source environment '$sourceName' for virtualenv '${env.name}' during task configuration.")
+            }
+        }
+        val virtualenvTask = registerVirtualenvTask(project, env, envs, sourceTaskProvider)
+        buildVirtualenvs.configure { dependsOn(virtualenvTask) }
+    }
+
+    private fun configureCondaEnvTask(
+        project: Project, env: CondaEnv, envs: PythonEnvsExtension, buildCondaEnvs: TaskProvider<Task>
+    ) {
+        val sourceName = env.sourceEnvName.get()
+        val taskName = "Bootstrap_${sourceName}"
+
+        // Source task is now guaranteed to be registered (either explicitly or implicitly in afterEvaluate)
+        val sourceTaskProvider: Provider<TaskProvider<out Task>> = project.provider {
+            project.tasks.named<Task>(taskName)
+        }
+
+        val condaEnvTask = registerCondaEnvTask(project, env, envs, sourceTaskProvider)
+        buildCondaEnvs.configure { dependsOn(condaEnvTask) }
+    }
+
+    private fun registerInstallPythonBuildTask(
+        project: Project, installDir: Provider<Directory?>
+    ): TaskProvider<InstallPythonBuildTask> {
+        return project.tasks.register<InstallPythonBuildTask>("install_python_build") {
             description = "Downloads and installs python-build (from pyenv) if needed on Unix systems."
-            onlyIf { isUnix && !installDir.exists() }
-
-            doFirst {
-                project.layout.buildDirectory.get().asFile.mkdirs()
-                installDir.mkdirs() // Ensure install dir parent exists
-            }
-
-            doLast {
-                val pyenvZip = project.layout.buildDirectory.get().asFile.resolve("pyenv.zip")
-                val unzipFolder = project.layout.buildDirectory.get().asFile.resolve("python-build-tmp")
-                try {
-                    project.logger.quiet("Downloading latest pyenv from github")
-                    project.ant.invokeMethod("get", mapOf(
-                        "dest" to pyenvZip,
-                        "src" to URI("https://github.com/pyenv/pyenv/archive/master.zip").toURL(),
-                        "verbose" to true
-                    ))
-
-                    val pathToPythonBuildInPyenv = "pyenv-master/plugins/python-build/"
-                    project.logger.quiet("Unzipping python-build to $unzipFolder")
-                    project.copy {
-                        from(project.zipTree(pyenvZip))
-                        into(unzipFolder)
-                        include("$pathToPythonBuildInPyenv**")
-                        eachFile(object : Action<FileCopyDetails> {
-                            override fun execute(details: FileCopyDetails) {
-                                details.path = details.path.removePrefix(pathToPythonBuildInPyenv)
-                            }
-                        })
-                        includeEmptyDirs = false // Avoid potential issues with empty dirs
-                    }
-
-                    val installScript = unzipFolder.resolve("install.sh")
-                    if (installScript.exists()) {
-                        installScript.setExecutable(true)
-                        project.logger.quiet("Installing python-build via bash to $installDir")
-                        project.exec {
-                            // Use environment variable correctly
-                            environment("PREFIX", installDir.absolutePath)
-                            commandLine("bash", installScript.absolutePath)
-                        }
-                    } else {
-                        throw GradleException("install.sh not found in extracted python-build")
-                    }
-
-                    project.logger.quiet("Successfully installed python-build to $installDir")
-                } finally {
-                    project.logger.quiet("Removing temporary files")
-                    unzipFolder.deleteRecursively()
-                    pyenvZip.delete()
-                }
-            }
-        }.get() // Get the configured task
+            group = "Build Environment Setup"
+            this.installDir.set(installDir.get())
+        }
     }
 
-    private fun createPythonUnixTask(project: Project, env: Python, installPythonBuildTask: Task): Task {
-        return project.tasks.register("Bootstrap_${env.type}_${env.name}") {
+    private fun registerPythonUnixTask(
+        project: Project,
+        env: Python,
+        installPythonBuildTask: TaskProvider<InstallPythonBuildTask>,
+        pipOptions: Property<String>
+    ): TaskProvider<BootstrapPythonUnixTask> {
+        return project.tasks.register<BootstrapPythonUnixTask>("Bootstrap_${env.name}") {
+            description = "Bootstraps Python/PyPy environment '${env.name}' using python-build."
+            group = "Build Environment"
             dependsOn(installPythonBuildTask)
-            onlyIf { isUnix && (!env.envDir.exists() || isPythonInvalid(project, env)) }
 
-            doFirst {
-                if (env.envDir.exists()) env.envDir.deleteRecursively()
-                env.envDir.mkdirs()
-            }
+            // Configure inputs/outputs from the extension object (env)
+            pythonBuildDir.set(installPythonBuildTask.flatMap { it.installDir })
+            pythonVersion.set(env.version)
+            patchFileUri.set(env.patchFileUri)
+            envDir.set(env.envDir)
+            envType.set(env.type)
+            packages.set(env.packages)
+            pipInstallOptions.set(pipOptions)
 
-            doLast {
-                project.logger.quiet("Creating ${env.type} '${env.name}' at ${env.envDir} using python-build")
-                val pythonBuildExecutable = project.layout.buildDirectory.file("python-build/bin/python-build").get().asFile
-                if (!pythonBuildExecutable.exists()) {
-                    throw GradleException("python-build executable not found at ${pythonBuildExecutable.path}. Ensure install_python_build task ran successfully.")
+            // Up-to-date check based on python exec existence might be useful
+            // outputs.upToDateWhen { envDir.file("bin/python").get().asFile.exists() } // Example check
+        }
+    }
+
+    private fun registerPythonWindowsTask(
+        project: Project, env: Python, getPipTask: TaskProvider<DownloadTask>, pipOptions: Property<String>
+    ): TaskProvider<BootstrapPythonWindowsTask> {
+        return project.tasks.register<BootstrapPythonWindowsTask>("Bootstrap_${env.name}") {
+            description = "Bootstraps Python environment '${env.name}' using the official Windows installer."
+            group = "Build Environment"
+            dependsOn(getPipTask)
+
+            // Configure inputs/outputs
+            pythonVersion.set(env.version)
+            use64Bit.set(env.use64Bit)
+            getPipScript.set(getPipTask.flatMap { it.destination })
+            envDir.set(env.envDir)
+            packages.set(env.packages)
+            pipInstallOptions.set(pipOptions)
+
+            onlyIf { isWindows }
+        }
+    }
+
+    private fun registerJythonTask(
+        project: Project,
+        env: Python,
+        jythonConfiguration: org.gradle.api.artifacts.Configuration,
+        pipOptions: Property<String>
+    ): TaskProvider<BootstrapJythonTask> {
+        return project.tasks.register<BootstrapJythonTask>("Bootstrap_${env.name}") {
+            description = "Bootstraps Jython environment '${env.name}' using the installer JAR."
+            group = "Build Environment"
+
+            // Configure inputs/outputs
+            jythonInstallerFiles = jythonConfiguration
+            envDir.set(env.envDir)
+            packages.set(env.packages)
+            pipInstallOptions.set(pipOptions)
+        }
+    }
+
+    private fun registerPythonFromZipTask(
+        project: Project, env: Python, getPipTask: TaskProvider<DownloadTask>, envs: PythonEnvsExtension
+    ): TaskProvider<BootstrapPythonFromZipTask> {
+        return project.tasks.register<BootstrapPythonFromZipTask>("Bootstrap_${env.name}_from_archive") {
+            description = "Bootstraps Python environment '${env.name}' from a Zip archive."
+            group = "Build Environment"
+            dependsOn(getPipTask)
+
+            // Configure inputs/outputs from extension
+            zipUrl.set(env.url)
+            envType.set(env.type)
+            use64Bit.set(env.use64Bit)
+            getPipScript.set(getPipTask.flatMap { it.destination })
+            envDir.set(env.envDir)
+            packages.set(env.packages)
+            pipInstallOptions.set(envs.pipInstallOptions)
+
+            // Ensure URL is provided
+            onlyIf { env.url.isPresent }
+        }
+    }
+
+    // Updated registration function for Virtualenv
+    private fun registerVirtualenvTask(
+        project: Project,
+        env: VirtualEnv,
+        envs: PythonEnvsExtension,
+        sourceTaskProvider: Provider<TaskProvider<out Task>>
+    ): TaskProvider<CreateVirtualenvTask> {
+
+        // Need Providers for source env details (dir, type, use64Bit)
+        // These depend on the *type* of the source environment config (Python or PythonFromZip)
+        val sourceEnvDetailsProvider: Provider<Triple<DirectoryProperty, Property<EnvType>, Property<Boolean>>> =
+            project.provider {
+                val sourceName = env.sourceEnvName.get()
+                val sourcePython = envs.pythons.findByName(sourceName)
+                val sourcePythonZip = envs.pythonsFromZip.findByName(sourceName)
+                when {
+                    sourcePython != null -> Triple(sourcePython.envDir, sourcePython.type, sourcePython.use64Bit)
+                    sourcePythonZip != null -> Triple(
+                        sourcePythonZip.envDir, sourcePythonZip.type, sourcePythonZip.use64Bit
+                    )
+                    // Should have been caught earlier, but defensive check
+                    else -> throw GradleException("Logic error: Source env '$sourceName' not found for virtualenv '${env.name}' during provider resolution.")
                 }
-
-                try {
-                    project.exec {
-                        executable(pythonBuildExecutable.absolutePath)
-                        if (env.patchFileUri != null) {
-                            project.logger.quiet("Applying patch from ${env.patchFileUri} to ${env.name}")
-                            // Try to resolve URI/Path for patch file
-                            val patchInput = try {
-                                val path = Paths.get(env.patchFileUri)
-                                if (Files.isRegularFile(path)) {
-                                    path.toFile().inputStream()
-                                } else {
-                                    throw InvalidPathException(env.patchFileUri, "Path is not a regular file")
-                                }
-                            } catch (e: InvalidPathException) {
-                                try {
-                                    URI(env.patchFileUri).toURL().openStream()
-                                } catch (urlE: Exception) {
-                                    throw GradleException("Patch file URI '${env.patchFileUri}' is not a valid file path or URL", urlE)
-                                }
-                            }
-                            standardInput = patchInput
-                            args("-p", env.version ?: "", env.envDir.absolutePath)
-                        } else {
-                            args(env.version ?: "", env.envDir.absolutePath)
-                        }
-                    }
-                    project.logger.quiet("Successfully created environment ${env.name}.")
-                } catch (e: Exception) {
-                    // Check if the environment is actually invalid *after* the attempt
-                    if (isPythonInvalid(project, env)) {
-                        project.logger.error("Failed to create Python environment ${env.name}: ${e.message}", e)
-                        throw GradleException("Python environment creation failed for ${env.name}: ${e.message}", e)
-                    } else {
-                        project.logger.warn("python-build execution for ${env.name} finished with an error, but the resulting environment seems valid. Warning: ${e.message}")
-                    }
-                }
-
-                // Upgrade pip/setuptools and install packages regardless of minor build errors if env looks valid
-                upgradePipAndSetuptools(project, project.extensions.getByType(), env)
-                pipInstall(project, project.extensions.getByType(), env, env.packages)
-            }
-        }.get()
-    }
-
-    private fun createPythonWindowsTask(project: Project, env: Python): Task {
-        return project.tasks.register("Bootstrap_${env.type}_${env.name}") {
-            onlyIf { isWindows && (!env.envDir.exists() || isPythonInvalid(project, env)) }
-
-            doFirst {
-                project.layout.buildDirectory.get().asFile.mkdirs()
-                if (env.envDir.exists()) env.envDir.deleteRecursively()
-                env.envDir.mkdirs()
             }
 
-            doLast {
-                project.logger.quiet("Creating ${env.type} '${env.name}' at ${env.envDir} directory on Windows")
-                val pythonVersion = env.version ?: throw GradleException("Python version must be specified for Windows installation")
-                try {
-                    val versionNumber = GradleVersion.version(pythonVersion)
-                    val isExe = versionNumber >= GradleVersion.version("3.5.0")
-                    val extension = if(isExe) "exe" else "msi"
-                    val archSuffix = if (env.is64 != false) (if (extension == "msi") "." else "-") + "amd64" else ""
-                    val filename = "python-$pythonVersion$archSuffix.$extension"
-                    val installer = project.layout.buildDirectory.get().asFile.resolve(filename)
+        return project.tasks.register<CreateVirtualenvTask>("Create_virtualenv_${env.name}") {
+            description =
+                "Creates virtual environment '${env.name}' from source '${env.sourceEnvName.getOrElse("unknown")}'."
+            group = "Build Environment"
+            dependsOn(sourceTaskProvider)
 
-                    project.logger.quiet("Downloading $filename")
-                    project.ant.invokeMethod("get", mapOf(
-                        "dest" to installer,
-                        "src" to URI("https://www.python.org/ftp/python/$pythonVersion/$filename").toURL(),
-                        "verbose" to true // Helps debug download issues
-                    ))
+            // Configure inputs from source env providers and virtualenv config
+            sourceEnvDir.set(sourceEnvDetailsProvider.flatMap { it.first })
+            sourceEnvType.set(sourceEnvDetailsProvider.flatMap { it.second })
+            sourceUse64Bit.set(sourceEnvDetailsProvider.flatMap { it.third })
 
-                    project.logger.quiet("Installing ${env.name} using $filename")
-                    if (extension == "msi") {
-                        project.exec {
-                            commandLine("msiexec", "/i", installer.absolutePath, "/quiet", "/qn", "TARGETDIR=${env.envDir.absolutePath}")
-                            isIgnoreExitValue = true // MSI quiet installs might return non-zero on success sometimes
-                        }
-                    } else { // exe
-                        project.exec {
-                            // Args based on Python 3.5+ installer
-                            // Ensure no user interaction prompts
-                            commandLine(installer.absolutePath, "/quiet", "InstallAllUsers=0", "Include_launcher=0", "TargetDir=${env.envDir.absolutePath}", "PrependPath=0", "Shortcuts=0", "AssociateFiles=0", "Include_doc=0", "Include_pip=1", "Include_tcltk=0", "Include_test=0")
-                            isIgnoreExitValue = true // Similar reason as MSI
-                        }
-                    }
-
-                    // Check if pip was installed correctly by the installer
-                    if (!getExecutable("pip", env).exists()) {
-                        project.logger.quiet("Pip not found after installation, attempting manual install with get-pip.py")
-                        val pythonExec = getExecutable("python", env)
-                        if (pythonExec.exists()) {
-                            project.exec {
-                                executable(pythonExec.absolutePath)
-                                args(getPipFile(project).absolutePath)
-                            }
-                        } else {
-                             project.logger.warn("Could not find python executable at ${pythonExec.path} to install pip.")
-                        }
-                    }
-
-                    // It's better to save installer for potential uninstall/repair, don't delete
-                    // installer.delete()
-                } catch (e: Exception) {
-                    project.logger.error("Error installing Python ${env.name} on Windows: ${e.message}", e)
-                    throw GradleException("Failed to install Python ${env.name} on Windows: ${e.message}", e)
-                }
-
-                // Upgrade pip/setuptools and install packages
-                 if (getExecutable("pip", env).exists()) {
-                    upgradePipAndSetuptools(project, project.extensions.getByType(), env)
-                    pipInstall(project, project.extensions.getByType(), env, env.packages)
-                 } else {
-                     project.logger.warn("Skipping pip upgrade and package install for ${env.name} because pip executable was not found.")
-                 }
-            }
-        }.get()
-    }
-
-    private fun createJythonTask(project: Project, env: Python): Task {
-        return project.tasks.register("Bootstrap_${env.type}_${env.name}") {
-            // Depend on the Jython configuration being resolved
-            dependsOn(project.configurations.getByName("jython"))
-            onlyIf { !env.envDir.exists() || isPythonInvalid(project, env) } // Jython might create a 'python' link
-
-            doFirst {
-                if (env.envDir.exists()) env.envDir.deleteRecursively()
-                // Don't mkdir here, Jython installer does it
-            }
-
-            doLast {
-                project.logger.quiet("Creating ${env.type} '${env.name}' at ${env.envDir} directory")
-                val jythonInstallerJar = project.configurations.getByName("jython").singleFile
-
-                project.javaexec {
-                    mainClass.set("-jar")
-                    args = listOf(jythonInstallerJar.absolutePath, "-s", "-d", env.envDir.absolutePath, "-t", "standard")
-                    classpath = project.files(jythonInstallerJar) // Define classpath explicitly
-                }
-
-                // Assuming Jython install includes pip or similar mechanism
-                pipInstall(project, project.extensions.getByType(), env, env.packages)
-            }
-        }.get()
-    }
-
-    // Helper for common pip upgrade logic
-    private fun upgradePipAndSetuptools(project: Project, envs: PythonEnvsExtension, env: Python) {
-        val pipExec = try { getExecutable("pip", env) } catch (e: Exception) { null }
-        if (pipExec == null || !pipExec.exists()) {
-            project.logger.warn("Cannot upgrade pip/setuptools for ${env.name}: pip executable not found.")
-            return
-        }
-        project.logger.quiet("Force upgrading pip and setuptools for ${env.name}")
-        val command = mutableListOf<String>(
-            getExecutable("python", env).absolutePath, // Use python -m pip
-             "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            "--force-reinstall" // Use force-reinstall for robustness
-        )
-        command.addAll(envs.pipInstallOptions.split(" ").filter { it.isNotBlank() })
-        command.addAll(listOf("pip", "setuptools"))
-
-        project.logger.quiet("Executing: ${command.joinToString(" ")}")
-        val result = project.exec {
-            commandLine = command
-            isIgnoreExitValue = true // Allow non-zero if already up-to-date or minor issues
-        }
-        if (result.exitValue != 0) {
-            project.logger.warn("Pip/setuptools upgrade command for ${env.name} exited with code ${result.exitValue}. Check logs if packages fail to install.")
-            // Don't throw GradleException here, allow proceeding if possible
+            envDir.set(env.envDir)
+            packages.set(env.packages)
+            pipInstallOptions.set(envs.pipInstallOptions)
         }
     }
 
-    // Helper for common pip install logic
-    private fun pipInstall(project: Project, envs: PythonEnvsExtension, env: Python, packages: List<String>?) {
-        if (packages.isNullOrEmpty() || env.type == null) {
-            return
-        }
-        val pipExec = try { getExecutable("pip", env) } catch (e: Exception) { null }
-        if (pipExec == null || !pipExec.exists()) {
-            project.logger.error("Cannot install packages for ${env.name}: pip executable not found at expected location.")
-            throw GradleException("pip executable not found for ${env.name}")
-        }
-
-        project.logger.quiet("Installing packages via pip for ${env.name}: $packages")
-        val command = mutableListOf<String>(
-            pipExec.absolutePath,
-            "install"
-        )
-        command.addAll(envs.pipInstallOptions.split(" ").filter { it.isNotBlank() })
-        command.addAll(packages)
-
-        project.logger.quiet("Executing: ${command.joinToString(" ")}")
-        val result = project.exec {
-            commandLine = command
-        }
-        if (result.exitValue != 0) {
-            throw GradleException("pip install failed for ${env.name} with packages $packages. Exit code: ${result.exitValue}")
+    private fun registerCondaTask(
+        project: Project, env: Conda, envs: PythonEnvsExtension
+    ): TaskProvider<BootstrapCondaTask> {
+        return project.tasks.register<BootstrapCondaTask>("Bootstrap_${env.name}") {
+            description = "Bootstraps base Conda environment '${env.name}'."
+            group = "Build Environment"
+            // Configure inputs from Conda object and extension
+            condaVersion.set(env.version)
+            envDir.set(env.envDir)
+            pipPackages.set(env.packages)
+            condaPackages.set(env.condaPackages)
+            pipInstallOptions.set(envs.pipInstallOptions)
         }
     }
 
-    // Helper for common conda install logic
-    private fun condaInstall(project: Project, conda: Conda, packages: List<String>?) {
-        if (packages.isNullOrEmpty()) {
-            return
-        }
-        val condaExec = try { getExecutable("conda", conda) } catch (e: Exception) { null }
-         if (condaExec == null || !condaExec.exists()) {
-            project.logger.error("Cannot install conda packages for ${conda.name}: conda executable not found at expected location.")
-            throw GradleException("conda executable not found for ${conda.name}")
+    private fun registerCondaEnvTask(
+        project: Project, env: CondaEnv, envs: PythonEnvsExtension, sourceTaskProvider: Provider<TaskProvider<out Task>>
+    ): TaskProvider<CreateCondaEnvTask> {
+        val sourceEnvDirProvider: Provider<DirectoryProperty> = project.provider {
+            val sourceName = env.sourceEnvName.get()
+            val sourceConda = envs.condas.findByName(sourceName)
+                ?: throw GradleException("Logic error: Source conda env '$sourceName' not found for conda env '${env.name}' during provider resolution.")
+            sourceConda.envDir
         }
 
-        project.logger.quiet("Installing packages via conda for ${conda.name}: $packages")
-        val command = mutableListOf<String>(
-            condaExec.absolutePath,
-            "install", "-y",
-            "-p", conda.envDir.absolutePath // Specify target environment explicitly
-        )
-        command.addAll(packages)
+        return project.tasks.register<CreateCondaEnvTask>("Create_conda_env_${env.name}") {
+            description =
+                "Creates Conda environment '${env.name}' from base '${env.sourceEnvName.getOrElse("unknown")}'"
+            group = "Build Environment"
+            dependsOn(sourceTaskProvider)
 
-        project.logger.quiet("Executing: ${command.joinToString(" ")}")
-        val result = project.exec {
-            commandLine = command
-        }
-        if (result.exitValue != 0) {
-             throw GradleException("conda install failed for ${conda.name} with packages $packages. Exit code: ${result.exitValue}")
+            // Configure inputs
+            sourceEnvDir.set(sourceEnvDirProvider.flatMap { it })
+            pythonVersion.set(env.version)
+            envDir.set(env.envDir)
+            pipPackages.set(env.packages)
+            condaPackages.set(env.condaPackages)
+            pipInstallOptions.set(envs.pipInstallOptions)
+
+            onlyIf { env.sourceEnvName.isPresent && env.version.isPresent }
         }
     }
-} 
+}

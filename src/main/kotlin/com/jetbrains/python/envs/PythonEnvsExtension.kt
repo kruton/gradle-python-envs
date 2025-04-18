@@ -1,300 +1,269 @@
 package com.jetbrains.python.envs
 
-import org.gradle.api.InvalidUserDataException
-import java.io.File
+import org.gradle.api.Named
+import org.gradle.api.NamedDomainObjectContainer
+import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.file.ProjectLayout
+import org.gradle.api.model.ObjectFactory
+import org.gradle.api.provider.ListProperty
+import org.gradle.api.provider.Property
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.InputDirectory
+import org.gradle.api.tasks.Optional
 import java.net.URI
 import java.net.URL
+import javax.inject.Inject
 
-/**
- * Project extension to configure Python build environment.
- *
- */
-open class PythonEnvsExtension {
-    var bootstrapDirectory: File? = null
-    var envsDirectory: File? = null
-
-    var zipRepository: URL? = null
-    var shouldUseZipsFromRepository: Boolean = false
-
-    var is64Bits: Boolean = true  // By default 64 bit envs should be installed
-    var condaDefaultVersion: String = "Miniconda2-latest"
-    var pypyDefaultVersion: String = "pypy2.7-5.8.0"
-    // No direct equivalent for @SuppressWarnings("unused") in Kotlin for unused properties in this context,
-    // but the compiler will warn if it's truly unused elsewhere.
-    var pipInstallOptions: String = "--trusted-host pypi.python.org --trusted-host pypi.org --trusted-host files.pythonhosted.org"
-
-    val pythons: MutableList<Python> = mutableListOf()
-    val condas: MutableList<Conda> = mutableListOf()
-    val condaEnvs: MutableList<CondaEnv> = mutableListOf()
-    val virtualEnvs: MutableList<VirtualEnv> = mutableListOf()
-    val pythonsFromZip: MutableList<Python> = mutableListOf()
-
-    val CONDA_PREFIX: String = "CONDA_"
-
-    /**
-     * @param envName name of environment like "env_for_django"
-     * @param version py version like "3.4"
-     * @param packages collection of py packages to install
-     * @param patchFileUri URI of a patch to apply when building Python (see the `python-build`'s `-p` option). Absolute paths are also accepted.
-     */
-    @JvmOverloads
-    fun python(envName: String,
-               version: String,
-               architecture: String? = null,
-               packages: List<String>? = null,
-               patchFileUri: String? = null) {
-        val localBootstrapDirectory = bootstrapDirectory ?: throw IllegalStateException("bootstrapDirectory must be set")
-        if (zipRepository != null && shouldUseZipsFromRepository) {
-            if (patchFileUri != null) {
-                throw InvalidUserDataException("A patch is defined for a pre-built Python")
-            }
-            val url = getUrlFromRepository("python", version, architecture)
-                ?: throw InvalidUserDataException("Could not determine URL for pre-built python $version ($architecture)")
-            pythonFromZip(envName, url, "python", packages)
-        } else {
-            pythons.add(Python(envName, localBootstrapDirectory, EnvType.PYTHON, version, is64(architecture), packages, null, patchFileUri))
-        }
-    }
-
-    // Overload provided by @JvmOverloads now
-    // fun python(envName: String, version: String, packages: List<String>? = null) {
-    //     python(envName, version, null, packages)
-    // }
-
-    /**
-     * @see python
-     * @param urlToArchive URL link to archive with environment
-     */
-    @JvmOverloads
-    fun pythonFromZip(envName: String,
-                      urlToArchive: URL,
-                      type: String? = null,
-                      packages: List<String>? = null) {
-        val localBootstrapDirectory = bootstrapDirectory ?: throw IllegalStateException("bootstrapDirectory must be set")
-        pythonsFromZip.add(Python(
-            envName,
-            localBootstrapDirectory,
-            EnvType.fromString(type),
-            null,
-            null,
-            packages,
-            urlToArchive
-        ))
-    }
-
-    /**
-     * @see python
-     * @param sourceEnvName name of inherited environment like "env_for_django"
-     */
-    @JvmOverloads
-    fun virtualenv(envName: String, sourceEnvName: String, packages: List<String>? = null) {
-        val localEnvsDirectory = envsDirectory ?: throw IllegalStateException("envsDirectory must be set")
-        val pythonEnv = (pythons + pythonsFromZip).find { it.name == sourceEnvName }
-        if (pythonEnv != null) {
-            virtualEnvs.add(VirtualEnv(envName, localEnvsDirectory, pythonEnv, packages))
-        } else {
-            println("Specified environment '$sourceEnvName' for virtualenv '$envName' isn't found")
-        }
-    }
-
-    /**
-     * @see python
-     */
-    @JvmOverloads
-    fun conda(envName: String,
-              version: String,
-              architecture: String? = null,
-              packages: List<String>? = null) {
-        val localBootstrapDirectory = bootstrapDirectory ?: throw IllegalStateException("bootstrapDirectory must be set")
-        val pipPackages = packages?.filter { !it.startsWith(CONDA_PREFIX) }
-        val condaPackages = packages?.filter { it.startsWith(CONDA_PREFIX) }
-            ?.map { it.substring(CONDA_PREFIX.length) }
-        condas.add(Conda(envName, localBootstrapDirectory, version, is64(architecture), pipPackages, condaPackages))
-    }
-
-    // Overload provided by @JvmOverloads
-    // fun conda(envName: String, version: String, packages: List<String>? = null) {
-    //     conda(envName, version, null, packages)
-    // }
-
-    @JvmOverloads
-    fun conda(envName: String, packages: List<String>? = null) {
-        conda(envName, condaDefaultVersion, null, packages)
-    }
-
-    /**
-     * @see python
-     * @param sourceEnvName name of inherited environment like "env_for_django"
-     */
-    @JvmOverloads
-    fun condaenv(envName: String,
-                 version: String,
-                 sourceEnvName: String? = null,
-                 packages: List<String>? = null) {
-        val localEnvsDirectory = envsDirectory ?: throw IllegalStateException("envsDirectory must be set")
-        val pipPackages = packages?.filter { !it.startsWith(CONDA_PREFIX) }
-        val condaPackages = packages?.filter { it.startsWith(CONDA_PREFIX) }
-            ?.map { it.substring(CONDA_PREFIX.length) }
-
-        val actualSourceEnvName = sourceEnvName ?: condaDefaultVersion
-        if (sourceEnvName == null && condas.none { it.name == condaDefaultVersion }) {
-            // If no source is specified and the default doesn't exist, create the default conda env first
-            conda(condaDefaultVersion)
-        }
-        val condaEnv = condas.find { it.name == actualSourceEnvName }
-
-        if (condaEnv != null) {
-            condaEnvs.add(CondaEnv(envName, localEnvsDirectory, condaEnv, version, pipPackages, condaPackages))
-        } else {
-            // This case might be less likely now due to the check above, but kept for safety
-            println("Specified environment '$actualSourceEnvName' for condaenv '$envName' isn't found")
-        }
-    }
-
-    // Overload provided by @JvmOverloads
-    // fun condaenv(envName: String, version: String, packages: List<String>?) {
-    //     condaenv(envName, version, null, packages)
-    // }
-
-    /**
-     * @see python
-     */
-    @JvmOverloads
-    fun jython(envName: String, packages: List<String>? = null) {
-        val localBootstrapDirectory = bootstrapDirectory ?: throw IllegalStateException("bootstrapDirectory must be set")
-        pythons.add(Python(envName, localBootstrapDirectory, EnvType.JYTHON, null, null, packages))
-    }
-
-    /**
-     * @see python
-     */
-    @JvmOverloads
-    fun pypy(envName: String, version: String? = null, packages: List<String>? = null) {
-        val localBootstrapDirectory = bootstrapDirectory ?: throw IllegalStateException("bootstrapDirectory must be set")
-        pythons.add(Python(
-            envName,
-            localBootstrapDirectory,
-            EnvType.PYPY,
-            version ?: pypyDefaultVersion,
-            null, // pypy-build does not support architecture specification AFAIK
-            packages
-        ))
-    }
-
-    // Overload provided by @JvmOverloads
-    // fun pypy(envName: String, packages: List<String>?) {
-    //     pypy(envName, null, packages)
-    // }
-
-    /**
-     * @see python
-     */
-    @JvmOverloads
-    fun ironpython(envName: String,
-                   architecture: String? = null,
-                   packages: List<String>? = null,
-                   urlToArchive: URL? = null) {
-        val localBootstrapDirectory = bootstrapDirectory ?: throw IllegalStateException("bootstrapDirectory must be set")
-        // Consider making this URL configurable or checking its validity
-        val urlToIronPythonZip = URI("https://github.com/IronLanguages/ironpython2/releases/download/ipy-2.7.9/IronPython.2.7.9.zip").toURL()
-        pythonsFromZip.add(Python(
-            envName,
-            localBootstrapDirectory,
-            EnvType.IRONPYTHON,
-            null, // IronPython version is often tied to the zip
-            is64(architecture),
-            packages,
-            urlToArchive ?: urlToIronPythonZip
-        ))
-    }
-
-    // Overload provided by @JvmOverloads
-    // fun ironpython(envName: String, packages: List<String>?, urlToArchive: URL? = null) {
-    //     ironpython(envName, null, packages, urlToArchive)
-    // }
-
-    fun condaPackage(packageName: String): String {
-        return CONDA_PREFIX + packageName
-    }
-
-    private fun is64(architecture: String?): Boolean {
-        return architecture?.let { it != "32" } ?: is64Bits
-    }
-
-    private fun getUrlFromRepository(type: String, version: String, architecture: String? = null): URL? {
-        val repoUri = zipRepository?.toURI() ?: return null
-        val archSuffix = architecture ?: (if (is64Bits) "64" else "32")
-        return repoUri.resolve("$type-$version-$archSuffix.zip").toURL()
-    }
-}
-
-
-enum class EnvType {
-    PYTHON,
-    CONDA,
-    JYTHON,
-    PYPY,
-    IRONPYTHON,
-    VIRTUALENV;
-    // TODO non-python virtualenv?
-
+abstract class PythonEnvsExtension @Inject constructor(objects: ObjectFactory, projectLayout: ProjectLayout) {
     companion object {
-        // Making fromString safer against invalid inputs
-        fun fromString(type: String?): EnvType? {
-            return type?.let {
-                try {
-                    valueOf(it.uppercase())
-                } catch (e: IllegalArgumentException) {
-                    println("Warning: Unknown EnvType string '$type'")
-                    null // Or throw an exception, depending on desired strictness
-                }
+        const val CONDA_DEFAULT_VERSION = "Miniconda2-latest"
+        const val PYPY_DEFAULT_VERSION = "pypy2.7-5.8.0"
+        const val IRONPYTHON_URL =
+            "https://github.com/IronLanguages/ironpython2/releases/download/ipy-2.7.9/IronPython.2.7.9.zip"
+    }
+
+    // Internal helper to avoid repetition
+    private fun configurePython(name: String, configure: Python.() -> Unit) {
+        pythons.create(name, configure)
+    }
+
+    private fun configurePythonFromZip(name: String, configure: Python.() -> Unit) {
+        pythonsFromZip.create(name, configure)
+    }
+
+    private fun configureVirtualEnv(name: String, configure: VirtualEnv.() -> Unit) {
+        virtualEnvs.create(name, configure)
+    }
+
+    private fun configureConda(name: String, configure: Conda.() -> Unit) {
+        condas.create(name, configure)
+    }
+
+    private fun configureCondaEnv(name: String, configure: CondaEnv.() -> Unit) {
+        condaEnvs.create(name, configure)
+    }
+
+    @get:InputDirectory
+    val bootstrapDirectory: DirectoryProperty =
+        objects.directoryProperty().convention(projectLayout.buildDirectory.dir("python-envs/bootstrap"))
+
+    @get:InputDirectory
+    val envsDirectory: DirectoryProperty =
+        objects.directoryProperty().convention(projectLayout.projectDirectory.dir("python-envs/envs"))
+
+    @get:Input
+    val pipInstallOptions: Property<String> = objects.property(String::class.java).convention("")
+
+    @get:Input
+    @get:Optional
+    val zipRepository: Property<URL> = objects.property(URL::class.java)
+
+    @get:Input
+    @get:Optional
+    val shouldUseZipsFromRepository: Property<Boolean> = objects.property(Boolean::class.java).convention(false)
+
+    val pythons: NamedDomainObjectContainer<Python> = objects.domainObjectContainer(Python::class.java) { name ->
+        objects.newInstance(Python::class.java, name).apply {
+            configureDefaultEnvDir(envsDirectory, objects)
+            type.convention(EnvType.PYTHON)
+            use64Bit.convention(true)
+        }
+    }
+    val pythonsFromZip: NamedDomainObjectContainer<Python> = objects.domainObjectContainer(Python::class.java) { name ->
+        objects.newInstance(Python::class.java, name).apply {
+            configureDefaultEnvDir(envsDirectory, objects)
+            use64Bit.convention(true)
+        }
+    }
+    val virtualEnvs: NamedDomainObjectContainer<VirtualEnv> =
+        objects.domainObjectContainer(VirtualEnv::class.java) { name ->
+            objects.newInstance(VirtualEnv::class.java, name).apply {
+                configureDefaultEnvDir(envsDirectory, objects)
+                type.convention(EnvType.VIRTUALENV)
             }
         }
+    val condas: NamedDomainObjectContainer<Conda> = objects.domainObjectContainer(Conda::class.java) { name ->
+        objects.newInstance(Conda::class.java, name).apply {
+            configureDefaultEnvDir(envsDirectory, objects)
+            type.convention(EnvType.CONDA)
+        }
+    }
+    val condaEnvs: NamedDomainObjectContainer<CondaEnv> = objects.domainObjectContainer(CondaEnv::class.java) { name ->
+        objects.newInstance(CondaEnv::class.java, name).apply {
+            configureDefaultEnvDir(envsDirectory, objects)
+            type.convention(EnvType.CONDA)
+            sourceEnvName.convention(CONDA_DEFAULT_VERSION)
+        }
+    }
+
+    // --- Groovy DSL Methods ---
+
+    @JvmOverloads
+    fun python(
+        name: String,
+        pythonVersion: String,
+        bits: String = "64",
+        packages: List<String> = emptyList(),
+        patchUri: String? = null
+    ) {
+        configurePython(name) {
+            this.type.set(EnvType.PYTHON)
+            this.version.set(pythonVersion)
+            this.use64Bit.set(bits != "32")
+            this.packages.set(packages)
+            if (patchUri != null) this.patchFileUri.set(patchUri)
+        }
+    }
+
+    fun python(name: String, pythonVersion: String, packages: List<String>) {
+        python(name, pythonVersion, "64", packages, null)
+    }
+
+    @JvmOverloads
+    fun virtualenv(name: String, sourceEnvName: String, packages: List<String> = emptyList()) {
+        configureVirtualEnv(name) {
+            this.type.set(EnvType.VIRTUALENV)
+            this.sourceEnvName.set(sourceEnvName)
+            this.packages.set(packages)
+        }
+    }
+
+    @JvmOverloads
+    fun conda(
+        name: String,
+        pythonVersion: String? = null,
+        architecture: String? = "64",
+        packagesList: List<Any> = emptyList()
+    ) {
+        configureConda(name) {
+            val pipPackages = packagesList.filterIsInstance<String>()
+            val condaPackages = packagesList.filterIsInstance<CondaPackageMarker>().map { it.name }
+            this.type.set(EnvType.CONDA)
+            this.use64Bit.set(architecture != "32")
+            this.version.set(pythonVersion ?: CONDA_DEFAULT_VERSION)
+            this.packages.set(pipPackages)
+            this.condaPackages.set(condaPackages)
+        }
+    }
+
+    fun conda(name: String, pythonVersion: String, packagesList: List<Any>) {
+        conda(name, pythonVersion, null, packagesList)
+    }
+
+    @JvmOverloads
+    fun condaenv(
+        name: String,
+        pythonVersion: String,
+        sourceEnvName: String? = null,
+        packagesList: List<Any> = emptyList()
+    ) {
+        configureCondaEnv(name) {
+            val pipPackages = packagesList.filterIsInstance<String>()
+            val condaPackages = packagesList.filterIsInstance<CondaPackageMarker>().map { it.name }
+            this.type.set(EnvType.CONDA)
+            this.version.set(pythonVersion)
+            this.condaPackages.set(condaPackages)
+            this.packages.set(pipPackages)
+            if (sourceEnvName != null) this.sourceEnvName.set(sourceEnvName)
+        }
+    }
+
+    fun condaenv(name: String, pythonVersion: String, packagesList: List<Any>) {
+        condaenv(name, pythonVersion, null, packagesList)
+    }
+
+    fun jython(name: String) {
+        configurePython(name) {
+            this.type.set(EnvType.JYTHON)
+            // Version is usually fixed by the jython-installer dependency, not set here.
+        }
+    }
+
+    @JvmOverloads
+    fun pypy(name: String, version: String? = null, packages: List<String> = emptyList()) {
+        configurePython(name) {
+            this.type.set(EnvType.PYPY)
+            this.version.set(version ?: PYPY_DEFAULT_VERSION)
+            this.packages.set(packages)
+        }
+    }
+
+    fun pypy(name: String, packages: List<String>) {
+        pypy(name, null, packages)
+    }
+
+    @JvmOverloads
+    fun ironpython(
+        name: String,
+        architecture: String = "64",
+        packages: List<String> = emptyList(),
+        url: String = IRONPYTHON_URL
+    ) {
+        // IronPython is typically fetched via zip
+        configurePythonFromZip(name) {
+            this.type.set(EnvType.IRONPYTHON)
+            this.use64Bit.set(architecture != "32")
+            this.packages.set(packages)
+            this.url.set(URI(url))
+        }
+    }
+
+    fun condaPackage(packageName: String): CondaPackageMarker {
+        return CondaPackageMarker(packageName)
     }
 }
 
+enum class EnvType { PYTHON, JYTHON, PYPY, IRONPYTHON, CONDA, VIRTUALENV }
 
-// Use 'open' to allow inheritance. Data classes are final by default.
-// Made properties val as they seem immutable after creation.
-// Use nullable types for optional parameters.
-open class Python(
-    val name: String,
-    dir: File, // Base directory where envDir will be created
-    val type: EnvType?,
-    val version: String?,
-    val is64: Boolean?, // Nullable because not all types use it (e.g., Jython, PyPy maybe)
-    val packages: List<String>?,
-    val url: URL? = null,
-    val patchFileUri: String? = null
-) {
-    // Calculated property
-    val envDir: File = File(dir, name)
+interface PythonEnv : Named {
+    val envDir: DirectoryProperty
+
+    @get:Optional
+    val packages: ListProperty<String>
+
+    val type: Property<EnvType>
+
+    fun configureDefaultEnvDir(baseEnvsDir: DirectoryProperty, objects: ObjectFactory) {
+        envDir.convention(baseEnvsDir.dir(name))
+    }
 }
 
+interface Python : PythonEnv {
+    @get:Optional
+    val version: Property<String>
 
-class VirtualEnv(
-    name: String,
-    dir: File,
-    val sourceEnv: Python,
-    packages: List<String>?
-) : Python(name, dir, EnvType.VIRTUALENV, sourceEnv.version, sourceEnv.is64, packages)
+    @get:Optional
+    val use64Bit: Property<Boolean>
 
+    @get:Optional
+    val patchFileUri: Property<String>
 
-open class Conda(
-    name: String,
-    dir: File,
-    version: String?, // Conda version itself (e.g., Miniconda version)
-    is64: Boolean?,
-    pipPackages: List<String>?,
-    val condaPackages: List<String>?
-) : Python(name, dir, EnvType.CONDA, version, is64, pipPackages) // Passing pipPackages as 'packages' to Python base
+    @get:Optional
+    val url: Property<URI>
+}
 
+interface Conda : PythonEnv {
+    @get:Optional
+    val version: Property<String>
 
-class CondaEnv(
-    name: String,
-    dir: File,
-    val sourceEnv: Conda,
-    version: String?, // Python version for the environment
-    pipPackages: List<String>?,
-    condaPackages: List<String>?
-) : Conda(name, dir, version, sourceEnv.is64, pipPackages, condaPackages) // Version here is Python version 
+    @get:Optional
+    val use64Bit: Property<Boolean>
+
+    @get:Optional
+    val condaPackages: ListProperty<String>
+}
+
+interface VirtualEnv : PythonEnv {
+    val sourceEnvName: Property<String>
+}
+
+interface CondaEnv : PythonEnv {
+    val sourceEnvName: Property<String>
+
+    val version: Property<String>
+
+    @get:Optional
+    val condaPackages: ListProperty<String>
+}
+
+data class CondaPackageMarker(val name: String)

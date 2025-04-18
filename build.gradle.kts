@@ -1,6 +1,7 @@
 plugins {
     idea
     `kotlin-dsl`
+    `groovy`
     id("com.gradle.plugin-publish") version "1.2.1"
     id("com.palantir.git-version") version "3.1.0"
     `maven-publish`
@@ -21,6 +22,10 @@ kotlin {
 
 repositories {
     mavenCentral()
+}
+
+tasks.withType<Test>() {
+    maxParallelForks = 8
 }
 
 publishing {
