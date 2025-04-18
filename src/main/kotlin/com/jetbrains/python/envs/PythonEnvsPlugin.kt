@@ -78,7 +78,7 @@ class PythonEnvsPlugin : Plugin<Project> {
         }
 
         private fun getPipFile(project: Project): File {
-            val file = project.buildDir.resolve("get-pip.py")
+            val file = project.layout.buildDirectory.get().asFile.resolve("get-pip.py")
             if (!file.exists()) {
                 project.ant.invokeMethod("get", mapOf(
                     "dest" to file,
@@ -176,7 +176,7 @@ class PythonEnvsPlugin : Plugin<Project> {
                         onlyIf { env.url != null && (!env.envDir.exists() || isPythonInvalid(project, env)) }
 
                         doFirst {
-                            project.buildDir.mkdirs()
+                            project.layout.buildDirectory.get().asFile.mkdirs()
                             if (env.envDir.exists()) env.envDir.deleteRecursively()
                             env.envDir.mkdirs()
                         }
@@ -189,7 +189,7 @@ class PythonEnvsPlugin : Plugin<Project> {
                                     throw GradleException("Wrong archive extension, only zip is supported (URL: $url)")
                                 }
 
-                                val zipArchive = project.buildDir.resolve(archiveName)
+                                val zipArchive = project.layout.buildDirectory.get().asFile.resolve(archiveName)
                                 logger.quiet("Downloading $archiveName archive from $url")
                                 project.ant.invokeMethod("get", mapOf("dest" to zipArchive, "src" to url, "verbose" to true))
 
@@ -325,7 +325,7 @@ class PythonEnvsPlugin : Plugin<Project> {
                         onlyIf { !env.envDir.exists() || isPythonInvalid(project, env) } // Check python inside conda
 
                         doFirst {
-                            project.buildDir.mkdirs()
+                            project.layout.buildDirectory.get().asFile.mkdirs()
                              if (env.envDir.exists()) env.envDir.deleteRecursively()
                              env.envDir.mkdirs()
                         }
@@ -333,7 +333,7 @@ class PythonEnvsPlugin : Plugin<Project> {
                         doLast {
                             val urlToConda = getUrlToDownloadConda(env)
                             val installerName = urlToConda.path.substring(urlToConda.path.lastIndexOf('/') + 1)
-                            val installer = project.buildDir.resolve(installerName)
+                            val installer = project.layout.buildDirectory.get().asFile.resolve(installerName)
 
                             if (!installer.exists()) {
                                 logger.quiet("Downloading $installerName")
@@ -417,13 +417,13 @@ class PythonEnvsPlugin : Plugin<Project> {
             onlyIf { isUnix && !installDir.exists() }
 
             doFirst {
-                project.buildDir.mkdirs()
+                project.layout.buildDirectory.get().asFile.mkdirs()
                 installDir.mkdirs() // Ensure install dir parent exists
             }
 
             doLast {
-                val pyenvZip = project.buildDir.resolve("pyenv.zip")
-                val unzipFolder = project.buildDir.resolve("python-build-tmp")
+                val pyenvZip = project.layout.buildDirectory.get().asFile.resolve("pyenv.zip")
+                val unzipFolder = project.layout.buildDirectory.get().asFile.resolve("python-build-tmp")
                 try {
                     project.logger.quiet("Downloading latest pyenv from github")
                     project.ant.invokeMethod("get", mapOf(
@@ -535,7 +535,7 @@ class PythonEnvsPlugin : Plugin<Project> {
             onlyIf { isWindows && (!env.envDir.exists() || isPythonInvalid(project, env)) }
 
             doFirst {
-                project.buildDir.mkdirs()
+                project.layout.buildDirectory.get().asFile.mkdirs()
                 if (env.envDir.exists()) env.envDir.deleteRecursively()
                 env.envDir.mkdirs()
             }
@@ -549,7 +549,7 @@ class PythonEnvsPlugin : Plugin<Project> {
                     val extension = if(isExe) "exe" else "msi"
                     val archSuffix = if (env.is64 != false) (if (extension == "msi") "." else "-") + "amd64" else ""
                     val filename = "python-$pythonVersion$archSuffix.$extension"
-                    val installer = project.buildDir.resolve(filename)
+                    val installer = project.layout.buildDirectory.get().asFile.resolve(filename)
 
                     project.logger.quiet("Downloading $filename")
                     project.ant.invokeMethod("get", mapOf(
