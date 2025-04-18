@@ -282,7 +282,7 @@ class PythonEnvsPlugin : Plugin<Project> {
 
                     dependsOn(tasks.register("Create_virtualenv_${env.name}") {
                         // Depend on the task that creates the source environment
-                        val sourceTaskName = "Bootstrap_${env.sourceEnv.type ?: "Unknown"}_${env.sourceEnv.name}" + if(envs.pythonsFromZip.contains(env.sourceEnv)) "_from_archive" else ""
+                        val sourceTaskName = "Bootstrap_${env.sourceEnv.type}_${env.sourceEnv.name}" + if(envs.pythonsFromZip.contains(env.sourceEnv)) "_from_archive" else ""
                         val sourceTask = tasks.findByName(sourceTaskName)
                         if(sourceTask != null) {
                            dependsOn(sourceTask)
@@ -290,7 +290,7 @@ class PythonEnvsPlugin : Plugin<Project> {
                             logger.warn("Could not find source task '$sourceTaskName' for virtualenv '${env.name}' dependency.")
                         }
 
-                        onlyIf { (!env.envDir.exists() || isPythonInvalid(project, env)) && env.sourceEnv.type != null }
+                        onlyIf { !env.envDir.exists() || isPythonInvalid(project, env) }
 
                         doFirst {
                              if (env.envDir.exists()) env.envDir.deleteRecursively()
