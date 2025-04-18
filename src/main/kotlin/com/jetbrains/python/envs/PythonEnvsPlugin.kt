@@ -355,7 +355,7 @@ class PythonEnvsPlugin : Plugin<Project> {
                             // Conda might come with a base python, check version?
 
                             pipInstall(project, envs, env, env.packages) // Install pip packages
-                            condaInstall(project, envs, env, env.condaPackages) // Install conda packages
+                            condaInstall(project, env, env.condaPackages) // Install conda packages
                         }
                     })
                 }
@@ -691,7 +691,7 @@ class PythonEnvsPlugin : Plugin<Project> {
     }
 
     // Helper for common conda install logic
-    private fun condaInstall(project: Project, envs: PythonEnvsExtension, conda: Conda, packages: List<String>?) {
+    private fun condaInstall(project: Project, conda: Conda, packages: List<String>?) {
         if (packages.isNullOrEmpty()) {
             return
         }
