@@ -1,6 +1,6 @@
 plugins {
     idea
-    groovy
+    `kotlin-dsl`
     id("com.gradle.plugin-publish") version "1.2.1"
     id("com.palantir.git-version") version "3.1.0"
     `maven-publish`
@@ -13,6 +13,10 @@ group = "com.jetbrains.python"
 
 java {
     sourceCompatibility = JavaVersion.VERSION_21
+}
+
+kotlin {
+    jvmToolchain(21)
 }
 
 repositories {
