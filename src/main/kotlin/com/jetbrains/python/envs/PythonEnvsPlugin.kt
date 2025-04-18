@@ -7,7 +7,7 @@ import org.gradle.api.Project
 import org.gradle.api.Task
 import org.gradle.api.file.FileCopyDetails
 import org.gradle.kotlin.dsl.* // Import Kotlin DSL extensions
-import org.gradle.util.VersionNumber
+import org.gradle.util.GradleVersion
 import java.io.File
 import java.net.URI
 import java.net.URL
@@ -544,8 +544,8 @@ class PythonEnvsPlugin : Plugin<Project> {
                 project.logger.quiet("Creating ${env.type} '${env.name}' at ${env.envDir} directory on Windows")
                 val pythonVersion = env.version ?: throw GradleException("Python version must be specified for Windows installation")
                 try {
-                    val versionNumber = VersionNumber.parse(pythonVersion)
-                    val isExe = versionNumber >= VersionNumber.parse("3.5.0")
+                    val versionNumber = GradleVersion.version(pythonVersion)
+                    val isExe = versionNumber >= GradleVersion.version("3.5.0")
                     val extension = if(isExe) "exe" else "msi"
                     val archSuffix = if (env.is64 != false) (if (extension == "msi") "." else "-") + "amd64" else ""
                     val filename = "python-$pythonVersion$archSuffix.$extension"
